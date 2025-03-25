@@ -1,0 +1,193 @@
+"use strict";
+
+// 📌 Import Required Modules
+let blindSignatures = require("blind-signatures");
+let { BigInteger } = require("jsbn");
+let crypto = require("crypto");
+
+// 📌 Constants
+const COPIES_REQUIRED = 10;
+const MAX_RANGE = 256;
+
+// 📌 Utility Function: Generate Secure Random Number
+function sample() {
+  return crypto.randomBytes(1).readUInt8();
+}
+
+// 📌 Secure Random Integer Generator
+function nextInt(range) {
+  if (range > MAX_RANGE) {
+    throw new Error(`Sorry, range cannot be more than ${MAX_RANGE}`);
+  }
+
+  let q = Math.floor(MAX_RANGE / range);
+  let max = q * range;
+  let n;
+  do {
+    n = sample();
+  } while (n >= max);
+  return n % range;
+}
+
+// 📌 Modular Exponentiation Function (RSA)
+function modExp(base, exp, mod) {
+  let bigBase = new BigInteger(base.toString());
+  let bigExp = new BigInteger(exp.toString());
+  let bigMod = new BigInteger(mod.toString());
+  return bigBase.modPow(bigExp, bigMod).intValue();
+}
+
+// 📌 RSA Encryption & Decryption Functions
+function encrypt(message, pubKey) {
+  return modExp(message, pubKey.e, pubKey.modulus);
+}
+
+function decrypt(ciphertext, privKey) {
+  return modExp(ciphertext, privKey.d, privKey.modulus);
+}
+
+function sign(message, privKey) {
+  return decrypt(message, privKey);
+}
+
+function verify(message, sig, pubKey) {
+  return encrypt(sig, pubKey) === message;
+}
+
+// 📌 SpyAgency Class (Blind Signatures Implementation)
+class SpyAgency {
+  constructor() {
+    this.key = blindSignatures.keyGeneration({ b: 2048 }); // 2048-bit key
+  }
+
+  // 📌 Consistency Check
+  consistent(blindHash, factor, hash) {
+    let n = this.key.keyPair.n;
+    let e = new BigInteger(this.key.keyPair.e.toString());
+    let bigHash = new BigInteger(hash, 16);
+    let computed = bigHash.multiply(factor.modPow(e, n)).mod(n).toString();
+    return blindHash.toString() === computed;
+  }
+
+  // 📌 Verify Document Contents
+  verifyContents(blindHash, blindingFactor, originalDoc) {
+    if (!originalDoc.match(/^The bearer of this signed document, .*, has full diplomatic immunity.$/)) {
+      return false;
+    }
+    let h = blindSignatures.messageToHash(originalDoc);
+    return this.consistent(blindHash, blindingFactor, h);
+  }
+
+  // 📌 Sign Documents with Blind Signatures
+  signDocument(blindDocs, response) {
+    if (blindDocs.length !== COPIES_REQUIRED) {
+      throw new Error(`Expected ${COPIES_REQUIRED} documents, received ${blindDocs.length}`);
+    }
+
+    let selected = nextInt(blindDocs.length);
+    console.log(`Agency selected index: ${selected}`);
+
+    response(selected, (blindingFactors, originalDocs) => {
+      for (let i = 0; i < blindDocs.length; i++) {
+        if (i === selected) continue;
+        if (!this.verifyContents(blindDocs[i], blindingFactors[i], originalDocs[i])) {
+          throw new Error(`Document ${i} is invalid`);
+        }
+      }
+      return blindSignatures.sign({
+        blinded: blindDocs[selected],
+        key: this.key,
+      });
+    });
+  }
+
+  get n() {
+    return this.key.keyPair.n.toString();
+  }
+
+  get e() {
+    return this.key.keyPair.e.toString();
+  }
+}
+
+// 📌 Generate Cover Identity Document
+function makeDocument(coverName) {
+  return `The bearer of this signed document, ${coverName}, has full diplomatic immunity.`;
+}
+
+// 📌 Blind Signature Functions
+function blind(msg, agency) {
+  return blindSignatures.blind({
+    message: msg,
+    N: agency.n,
+    E: agency.e,
+  });
+}
+
+function unblind(blindingFactor, sig, n) {
+  return blindSignatures.unblind({
+    signed: sig,
+    N: n,
+    r: blindingFactor,
+  });
+}
+
+// 📌 Setup Spy Agency & Cover Names
+let agency = new SpyAgency();
+const coverNames = ["James", "Natasha", "Ethan", "Jason", "Ava", "Noah", "Liam", "Olivia", "Sophia", "Mason"];
+
+let blindDocs = [];
+let blindingFactors = [];
+let originalDocs = [];
+
+// 📌 Generate Blind Documents
+coverNames.forEach(name => {
+  let doc = makeDocument(name);
+  let blindedObj = blind(doc, agency);
+
+  if (!blindedObj || !blindedObj.blinded || !blindedObj.r) {
+    console.error(`❌ Error: Failed to generate blind signature for ${name}`);
+    return;
+  }
+
+  originalDocs.push(doc);
+  blindDocs.push(blindedObj.blinded);
+  blindingFactors.push(blindedObj.r);
+});
+
+// 📌 Debugging Output
+console.log("✅ BlindDocs:", blindDocs.length, blindDocs);
+console.log("✅ Blinding Factors:", blindingFactors.length, blindingFactors);
+console.log("✅ Original Docs:", originalDocs.length, originalDocs);
+
+// 📌 Ensure Non-Empty BlindDocs Before Signing
+if (blindDocs.length > 0) {
+  console.log("🚀 Calling signDocument with blindDocs...");
+
+  agency.signDocument(blindDocs, (selected, verifyAndSign) => {
+    if (selected < 0 || selected >= blindDocs.length) {
+      console.error("❌ Error: Selected index out of range.");
+      return;
+    }
+
+    let blindedSignature = verifyAndSign(blindingFactors, originalDocs);
+
+    if (!blindedSignature) {
+      console.error("❌ Error: Failed to generate blinded signature.");
+      return;
+    }
+
+    let finalSignature = unblind(new BigInteger(blindingFactors[selected].toString()), blindedSignature, agency.n);
+
+    let isValid = blindSignatures.verify({
+      unblinded: finalSignature,
+      N: agency.n,
+      E: agency.e,
+      message: originalDocs[selected],
+    });
+
+    console.log(`Signature for "${coverNames[selected]}" is ${isValid ? "valid ✅" : "invalid ❌"}`);
+  });
+} else {
+  console.error("❌ Error: blindDocs is empty! Check your loop.");
+}

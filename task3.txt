@@ -1,0 +1,183 @@
+"use strict";
+
+const crypto = require("crypto");
+const blindSignatures = require("blind-signatures");
+
+const COIN_RIS_LENGTH = 20;
+const IDENT_STR = "IDENT";
+const BANK_STR = "ELECTRONIC_PIGGYBANK";
+
+// 🏦 Generate RSA Key for the Bank
+const BANK_KEY = blindSignatures.keyGeneration({ b: 2048 });
+const N = BANK_KEY.keyPair.n.toString();
+const E = BANK_KEY.keyPair.e.toString();
+
+// 🔹 Utility Functions
+function makeOTP(string) {
+  let buffer = Buffer.from(string);
+  let key = crypto.randomBytes(buffer.length);
+  let ciphertext = Buffer.alloc(buffer.length);
+  for (let i = 0; i < buffer.length; i++) {
+    ciphertext[i] = buffer[i] ^ key[i];
+  }
+  return { key: key.toString("hex"), ciphertext: ciphertext.toString("hex") };
+}
+
+function makeGUID() {
+  return crypto.randomBytes(48).toString("hex");
+}
+
+function hash(s) {
+  return crypto.createHash("sha256").update(s).digest("hex");
+}
+
+function randInt(range) {
+  return crypto.randomBytes(1).readUInt8() % range;
+}
+
+// 🪙 Coin Class
+class Coin {
+  constructor(purchaser, amount) {
+    this.amount = amount;
+    this.guid = makeGUID();
+    this.leftIdent = [];
+    this.rightIdent = [];
+    let leftHashes = [];
+    let rightHashes = [];
+
+    for (let i = 0; i < COIN_RIS_LENGTH; i++) {
+      let { key, ciphertext } = makeOTP(`${IDENT_STR}:${purchaser}`);
+      this.leftIdent.push(key);
+      leftHashes.push(hash(key));
+
+      this.rightIdent.push(ciphertext);
+      rightHashes.push(hash(ciphertext));
+    }
+
+    this.coinString = `${BANK_STR}-${this.amount}-${this.guid}-${leftHashes.join(',')}-${rightHashes.join(',')}`;
+    this.blind();
+  }
+
+  blind() {
+    let { blinded, r } = blindSignatures.blind({
+      message: this.toString(),
+      N: N,
+      E: E,
+    });
+    this.blinded = blinded;
+    this.blindingFactor = r;
+  }
+
+  unblind() {
+    this.signature = blindSignatures.unblind({
+      signed: this.signature,
+      N: N,
+      r: this.blindingFactor,
+    });
+  }
+
+  toString() {
+    return this.coinString;
+  }
+
+  getRis(isLeft, i) {
+    return isLeft ? this.leftIdent[i] : this.rightIdent[i];
+  }
+}
+
+// 🏦 Bank Functions
+function signCoin(blindedCoinHash) {
+  return blindSignatures.sign({
+    blinded: blindedCoinHash,
+    key: BANK_KEY,
+  });
+}
+
+function acceptCoin(coin) {
+  const isValid = blindSignatures.verify({
+    unblinded: coin.signature,
+    N: N,
+    E: E,
+    message: coin.toString(),
+  });
+
+  if (!isValid) {
+    throw new Error("Invalid coin signature. Rejecting coin.");
+  }
+
+  let selectedRIS = [];
+  let [cnst, amt, guid, leftHashes, rightHashes] = coin.toString().split("-");
+  if (cnst !== BANK_STR) {
+    throw new Error(`Invalid identity string: ${cnst} received, expected ${BANK_STR}`);
+  }
+
+  leftHashes = leftHashes.split(",");
+  rightHashes = rightHashes.split(",");
+
+  for (let i = 0; i < COIN_RIS_LENGTH; i++) {
+    let isLeft = randInt(2) === 0;
+    let selected = coin.getRis(isLeft, i);
+    let expectedHash = isLeft ? leftHashes[i] : rightHashes[i];
+
+    if (hash(selected) !== expectedHash) {
+      throw new Error("RIS hash mismatch. Possible tampered coin.");
+    }
+    selectedRIS.push(selected);
+  }
+
+  console.log("✅ Coin accepted by merchant.");
+  return selectedRIS;
+}
+
+// 🕵️‍♂️ Fraud Detection
+function determineCheater(guid, ris1, ris2) {
+  if (JSON.stringify(ris1) === JSON.stringify(ris2)) {
+    console.log("⚠️ Fraud detected: The merchant may be attempting duplicate RIS reporting.");
+    return;
+  }
+
+  for (let i = 0; i < COIN_RIS_LENGTH; i++) {
+    try {
+      let buffer1 = Buffer.from(ris1[i], "hex");
+      let buffer2 = Buffer.from(ris2[i], "hex");
+
+      if (buffer1.length !== buffer2.length) {
+        console.log(`🚨 Error: RIS values at index ${i} have different lengths! Possible tampering.`);
+        return;
+      }
+
+      let xorResult = buffer1.map((byte, index) => byte ^ buffer2[index]);
+      let xorString = xorResult.toString();
+
+      if (xorString.startsWith(IDENT_STR)) {
+        console.log(`🚨 Double-spender identified! Coin was spent twice by: ${xorString}`);
+        return;
+      }
+    } catch (error) {
+      console.error(`❌ Error processing RIS at index ${i}:`, error.message);
+    }
+  }
+
+  console.log("❌ Error: The merchant is attempting fraud by reporting duplicate RIS.");
+}
+
+// 🔥 Simulation
+console.log("\n💰 Alice is creating a coin...");
+let coin = new Coin("alice", 20);
+
+console.log("\n🏦 The bank signs Alice's coin...");
+coin.signature = signCoin(coin.blinded);
+coin.unblind();
+
+console.log("\n🛒 Merchant 1 accepts the coin...");
+let ris1 = acceptCoin(coin);
+
+console.log("\n🛒 Merchant 2 also accepts the same coin (double spending attempt)...");
+let ris2 = acceptCoin(coin);
+
+console.log("\n🔍 The bank checks for double spending...");
+determineCheater(coin.guid, ris1, ris2);
+
+console.log("\n🔍 Checking for fraudulent merchants...");
+determineCheater(coin.guid, ris1, ris1);
+

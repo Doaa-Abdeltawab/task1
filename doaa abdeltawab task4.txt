@@ -1,0 +1,199 @@
+"use strict";
+
+const crypto = require('crypto');
+const keypair = require('keypair');
+const EventEmitter = require('events');
+
+// Constants
+const SIG_ALG = 'RSA-SHA256';
+const JOIN = "JOIN_NETWORK_REQUEST";
+const SYNC = "SYNC_LEDGER";
+const XFER = "XFER_FUNDS";
+
+// Network Simulation
+let miners = [];
+let minerNameMap = {};
+
+function getRandomInt(max) {
+  return Math.floor(Math.random() * max);
+}
+
+const net = {
+  registerMiner(...args) {
+    for (let m of args) {
+      miners.push(m);
+      if (m.name) minerNameMap[m.name] = m;
+    }
+  },
+
+  broadcast(msg, o) {
+    let s = JSON.stringify(o);
+    for (let m of miners) {
+      let delay = getRandomInt(1000);
+      setTimeout(() => m.emit(msg, JSON.parse(s)), delay);
+    }
+  },
+
+  send(recipient, msg, o) {
+    let s = JSON.stringify(o);
+    let m = minerNameMap[recipient];
+    if (m) {
+      let delay = getRandomInt(1000);
+      setTimeout(() => m.emit(msg, JSON.parse(s)), delay);
+    }
+  }
+};
+
+// Client Class
+class Client extends EventEmitter {
+  constructor(name, net) {
+    super();
+    this.name = name;
+    this.net = net;
+    this.keypair = keypair();
+    this.ledger = undefined;
+    this.clients = undefined;
+
+    this.net.registerMiner(this);
+
+    this.on(JOIN, this.addClient);
+    this.on(XFER, this.updateLedger);
+    this.on(SYNC, this.initialize);
+
+    this.join();
+  }
+
+  join() {
+    let msg = { name: this.name, pubKey: this.keypair.public };
+    this.net.broadcast(JOIN, msg);
+  }
+
+  initialize({ ledger, clients }) {
+    if (this.ledger || this.clients) return;
+    this.ledger = ledger;
+    this.clients = clients;
+  }
+
+  addClient({ name, pubKey }) {
+    if (!this.ledger || !this.clients) return;
+    if (this.ledger[name]) {
+      this.log(`${name} already exists.`);
+      return;
+    }
+    this.ledger[name] = 0;
+    this.clients[name] = pubKey;
+    this.net.send(name, SYNC, { ledger: this.ledger, clients: this.clients });
+  }
+
+  give(name, amount) {
+    let message = { from: this.name, to: name, amount };
+    let signature = this.signObject(message);
+    this.net.broadcast(XFER, { message, signature });
+  }
+
+  updateLedger({ message, signature }) {
+    if (!this.ledger) return;
+
+    let valid = this.verifySignature({ message, name: message.from, signature });
+    if (!valid) {
+      this.log("Signature verification failed.");
+      this.punishCheater(message.from);
+      return;
+    }
+
+    if (!this.ledger[message.from] || !this.ledger[message.to]) {
+      this.log("Invalid sender or recipient.");
+      return;
+    }
+
+    if (this.ledger[message.from] < message.amount) {
+      this.log(`Insufficient funds for ${message.from}.`);
+      this.punishCheater(message.from);
+      return;
+    }
+
+    this.ledger[message.from] -= message.amount;
+    this.ledger[message.to] += message.amount;
+    this.log(`Transferred ${message.amount} from ${message.from} to ${message.to}.`);
+  }
+
+  punishCheater(name) {
+    this.log(`Cheater ${name} detected!`);
+  }
+
+  signObject(obj) {
+    let s = JSON.stringify(obj);
+    let signer = crypto.createSign(SIG_ALG);
+    return signer.update(s).sign(this.keypair.private, 'hex');
+  }
+
+  verifySignature({ message, name, signature }) {
+    let s = JSON.stringify(message);
+    let verifier = crypto.createVerify(SIG_ALG);
+    let pubKey = this.clients[name];
+    try {
+      return verifier.update(s).verify(pubKey, signature, 'hex');
+    } catch (e) {
+      this.log(`Signature error: ${e.message}`);
+      return false;
+    }
+  }
+
+  showLedger() {
+    this.log(JSON.stringify(this.ledger));
+  }
+
+  log(msg) {
+    console.log(`${this.name} >>> ${msg}`);
+  }
+}
+
+// Strict Client subclass
+class StrictClient extends Client {
+  punishCheater(name) {
+    this.log(`Client ${name} is a cheater! Removing...`);
+    delete this.ledger[name];
+    delete this.clients[name];
+  }
+}
+
+// Test Scenario
+let alice = new StrictClient('Alice', net);
+alice.ledger = { 'Alice': 800 };
+alice.clients = { 'Alice': alice.keypair.public };
+
+let bob = new StrictClient('Bob', net);
+let charlie = new StrictClient('Charlie', net);
+let trudy = new StrictClient('Trudy', net);
+
+// Delay transactions to wait for network sync
+setTimeout(() => {
+  alice.give('Bob', 150);
+  alice.give('Charlie', 75);
+  alice.give('Trudy', 250);
+  bob.give('Charlie', 15);
+
+  // Trudy fakes a transaction only to Bob
+  trudy.fakeGive = function(name, amount) {
+    let message = { from: this.name, to: name, amount };
+    let signature = this.signObject(message);
+    net.send(name, XFER, { message, signature });
+    this.log(`Secretly sent ${amount} to ${name}`);
+  };
+
+  trudy.fakeGive('Bob', 100);
+
+  setTimeout(() => {
+    bob.give('Charlie', 200); // Should fail if Bob believed the fake funds
+
+    setTimeout(() => {
+      console.log("\n--- Final Ledgers ---");
+      alice.showLedger();
+      bob.showLedger();
+      charlie.showLedger();
+      trudy.showLedger();
+    }, 1500);
+  }, 1000);
+
+}, 1000);
+
